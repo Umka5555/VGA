@@ -1,0 +1,24 @@
+// 1. Регистр VERSION (0x00) — только чтение (всегда 1)
+always @(posedge S_AXI_ACLK) begin
+    if (S_AXI_ARESETN == 1'b0) 
+        slv_reg0 <= 32'h0000_0001;
+    else                       
+        slv_reg0 <= 32'h0000_0001;
+end
+
+// 2. Регистр CONTROL (0x04) — управление
+// Бит [0] - EN (разрешение), Бит [1] - P (опрос), Бит [2] - SL (ручной Select)
+assign polling = slv_reg1[1] & slv_reg1[0]; 
+assign select  = slv_reg1[2] & slv_reg1[0]; 
+
+// 3. Регистр STATUS (0x08) — только чтение (статус кнопок)
+always @(posedge S_AXI_ACLK) begin
+    if (S_AXI_ARESETN == 1'b0) 
+        slv_reg2 <= 32'h0000_0000;
+    else                       
+        slv_reg2 <= gp_status;
+end
+
+// 4. Регистр INTERRUPT (0x0C) — прерывания
+// Разрешаем прерывание, если установлен бит [3] в CONTROL и бит [0] в INTERRUPT
+assign interrupt = slv_reg3[0] & slv_reg1[3];
