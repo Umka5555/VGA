@@ -1,0 +1,379 @@
+// ============================================================================
+// Модуль: SEGAGamePad_logic
+// Назначение:
+//   - Опрос 9-пинового геймпада SEGA (мультиплексирование через gp_sel);
+//   - Формирование регистра состояния кнопок gp_status;
+//   - Аппаратное обнаружение двойного нажатия (double click);
+//   - Аппаратное обнаружение длительного нажатия (long press);
+//   - Формирование флагов прерываний по событиям кнопок.
+//
+// Карта разрядов gp_status / interrupt_flag:
+//   [0]  UP      [1]  DOWN    [2]  LEFT    [3]  RIGHT
+//   [4]  A       [5]  B       [6]  C       [7]  START
+//   [8]  MODE    [9]  X       [10] Y       [11] Z
+//   [21:16] — «сырые» значения линий (для отладки через ILA)
+// ============================================================================
+
+module SEGAGamePad_logic
+#(
+    // Количество тактов clk для отсчёта одной микросекунды.
+    // При частоте 150 МГц: 150 тактов = 1 мкс.
+    DELAY_US_TICKS = 150,
+
+    // Порог длительного нажатия в микросекундах (по умолчанию 1 000 000 мкс = 1 с)
+    LONG_PRESS_US  = 1_000_000,
+
+    // Окно ожидания повторного нажатия для двойного клика (по умолчанию 300 000 мкс = 300 мс)
+    DOUBLE_CLICK_US = 300_000
+)
+(
+    input  logic clk,          // Тактовый сигнал (150 МГц)
+    input  logic rst_n,        // Асинхронный сброс, активный низким уровнем
+
+    // ------- Управление из регистра CONTROL (AXI-Lite) -------
+    input  logic polling,      // 1 — режим непрерывного опроса, 0 — ручной режим
+    input  logic select,       // Значение gp_sel в ручном режиме
+
+    // ------- Физические линии геймпада -------
+    input  logic gp_up_z,      // UP / Z
+    input  logic gp_down_y,    // DOWN / Y
+    input  logic gp_left_x,    // LEFT / X
+    input  logic gp_right_mode,// RIGHT / MODE
+    input  logic gp_c_start,   // C / START
+    input  logic gp_b_a,       // B / A
+
+    // ------- Выходы -------
+    output logic gp_sel,               // Управление мультиплексором геймпада
+    output logic [31:0] gp_status,     // Текущее состояние кнопок (регистр STATUS)
+    output logic [11:0] interrupt_flag // Флаги прерываний (регистр INTERRUPT, R/W1C)
+);
+
+    // =========================================================================
+    // 1. Нумерация битов кнопок в gp_status / interrupt_flag
+    // =========================================================================
+    typedef enum {
+        UP_BTN = 0, DOWN_BTN, LEFT_BTN, RIGHT_BTN,
+        A_BTN, B_BTN, C_BTN, START_BTN, MODE_BTN,
+        X_BTN, Y_BTN, Z_BTN
+    } BUTTON_t;
+
+    // =========================================================================
+    // 2. Объявление FSM (размещено до счётчиков, т.к. state используется в assign)
+    // =========================================================================
+    typedef enum {
+        IDEL,       // Ожидание (пауза между опросами)
+        WAIT_LOW,   // Установка Select = 0 и ожидание 20 мкс
+        READ_LOW,   // Чтение кнопок при Select = 0
+        WAIT_HIGH,  // Установка Select = 1 и ожидание 20 мкс
+        READ_HIGH   // Чтение кнопок при Select = 1
+    } gp_read_state_t;
+
+    gp_read_state_t state, next_state;
+
+    // =========================================================================
+    // 3. Параметры задержек и счётчиков опроса
+    // =========================================================================
+    localparam int C_WAIT_DELAY    = 20;                  // 20 мкс на установку Select
+    localparam int C_POLLING_DELAY = 10000 / C_WAIT_DELAY; // 10 мс / 20 мкс = 500
+
+    // Счётчики опроса
+    logic [$bits(DELAY_US_TICKS)-1 : 0] us_counter;       // 1 мкс
+    logic [$bits(C_WAIT_DELAY)-1 : 0]   dly_counter;      // 20 мкс
+    logic [$bits(C_POLLING_DELAY)-1 : 0] polling_counter; // 10 мс
+
+    // Импульсы переполнения счётчиков (длительностью 1 такт)
+    logic counter_us_pulse;  // импульс каждую 1 мкс
+    logic dly_pulse;         // импульс каждые 20 мкс
+    logic polling_pulse;     // импульс раз в 10 мс (в состоянии IDEL)
+
+    // =========================================================================
+    // 4. Логика счётчиков опроса
+    // =========================================================================
+
+    // --- Счётчик микросекунд ---
+    always_ff @(posedge clk) begin : us_counter_alw
+        if (!rst_n)
+            us_counter <= '0;
+        else if (us_counter == DELAY_US_TICKS - 1)
+            us_counter <= '0;          // Сброс через 1 мкс
+        else
+            us_counter <= us_counter + 1'b1;
+    end
+
+    // Импульс каждую 1 мкс (1 такт)
+    assign counter_us_pulse = (us_counter == DELAY_US_TICKS - 1);
+
+    // --- Счётчик задержки установки 20 мкс ---
+    always_ff @(posedge clk) begin : dly_counter_alw
+        if (!rst_n)
+            dly_counter <= '0;
+        else if (counter_us_pulse) begin
+            if (dly_counter == C_WAIT_DELAY - 1)
+                dly_counter <= '0;      // Сброс через 20 мкс
+            else
+                dly_counter <= dly_counter + 1'b1;
+        end
+    end
+
+    // Импульс на последнем такте 20-мкс интервала
+    assign dly_pulse = (dly_counter == C_WAIT_DELAY - 1) && counter_us_pulse;
+
+    // --- Счётчик паузы между опросами (10 мс) ---
+    always_ff @(posedge clk) begin : polling_counter_alw
+        if (!rst_n)
+            polling_counter <= '0;
+        else if (dly_pulse && (state == IDEL)) begin
+            if (polling_counter == C_POLLING_DELAY - 1)
+                polling_counter <= '0;   // Сброс через 10 мс
+            else
+                polling_counter <= polling_counter + 1'b1;
+        end
+    end
+
+    // Импульс раз в 10 мс (только в состоянии IDEL)
+    assign polling_pulse = (polling_counter == C_POLLING_DELAY - 1)
+                        && dly_pulse
+                        && (state == IDEL);
+
+    // =========================================================================
+    // 5. FSM управления опросом GamePad
+    // =========================================================================
+
+    // Регистр текущего состояния
+    always_ff @(posedge clk) begin
+        if (!rst_n) state <= IDEL;
+        else        state <= next_state;
+    end
+
+    // Комбинационная логика переходов
+    always_comb begin : next_state_alw
+        next_state = state;
+        case (state)
+            IDEL: begin
+                if (polling && polling_pulse)     // Автоматический режим
+                    next_state = WAIT_LOW;
+                else if (!polling && select)      // Ручной режим: Select = 1
+                    next_state = WAIT_HIGH;
+                else if (!polling && !select)     // Ручной режим: Select = 0
+                    next_state = WAIT_LOW;
+            end
+            WAIT_LOW:  if (dly_pulse) next_state = READ_LOW;
+            READ_LOW:                 next_state = WAIT_HIGH;
+            WAIT_HIGH: if (dly_pulse) next_state = READ_HIGH;
+            READ_HIGH:                next_state = IDEL;
+            default:                  next_state = IDEL;
+        endcase
+    end
+
+    // =========================================================================
+    // 6. Управление сигналом Select
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (!rst_n)
+            gp_sel <= '0;
+        else if (polling) begin
+            // Автоматический режим: FSM управляет Select
+            if (state == WAIT_LOW)       gp_sel <= '0;
+            else if (state == WAIT_HIGH) gp_sel <= '1;
+        end else begin
+            // Ручной режим: прямое управление из регистра CONTROL
+            gp_sel <= select;
+        end
+    end
+
+    // =========================================================================
+    // 7. Захват текущего состояния кнопок
+    // =========================================================================
+    always_ff @(posedge clk) begin : read_btn_alw
+        if (!rst_n) begin
+            gp_status <= '0;
+        end else begin
+            case (state)
+                READ_LOW: begin
+                    // Кнопки, читаемые при Select = 0
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[A_BTN]     <= ~gp_b_a;
+                    gp_status[START_BTN] <= ~gp_c_start;
+                end
+                READ_HIGH: begin
+                    // Кнопки, читаемые при Select = 1
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[LEFT_BTN]  <= ~gp_left_x;
+                    gp_status[RIGHT_BTN] <= ~gp_right_mode;
+                    gp_status[B_BTN]     <= ~gp_b_a;
+                    gp_status[C_BTN]     <= ~gp_c_start;
+                end
+                default: begin
+                    gp_status <= gp_status; // Сохраняем предыдущее значение
+                end
+            endcase
+
+            // Сырые значения линий для отладки (ILA)
+            gp_status[21:16] <= {gp_c_start, gp_b_a, gp_right_mode,
+                                 gp_left_x, gp_down_y, gp_up_z};
+        end
+    end
+
+    // =========================================================================
+    // 8. Аппаратное обнаружение двойного и длительного нажатия
+    // -------------------------------------------------------------------------
+    // Идея:
+    //   - Храним предыдущее состояние кнопок prev_btn[11:0];
+    //   - На каждом такте выделяем фронты нажатия (press_edge) и отпускания (release_edge);
+    //   - Для каждой кнопки независимо ведём:
+    //        * hold_timer      — счётчик времени удержания (для long press);
+    //        * dbl_timer       — счётчик окна ожидания второго нажатия (для double click);
+    //        * waiting_dbl     — флаг «ждём второе нажатие»;
+    //        * long_reported   — флаг «длительное нажатие уже отрапортовано»;
+    //   - По событиям выставляем биты в interrupt_flag (R/W1C-регистр).
+    // =========================================================================
+
+    // Предыдущее состояние кнопок (для детектора фронтов)
+    logic [11:0] prev_btn;
+
+    // Фронты: нажатие = 0→1 (для активно-высоких битов gp_status)
+    logic [11:0] press_edge;     // кнопка только что нажата
+    logic [11:0] release_edge;   // кнопка только что отпущена
+
+    // Счётчики времени (в мкс)
+    logic [31:0] hold_timer  [11:0]; // время удержания текущего нажатия
+    logic [31:0] dbl_timer   [11:0]; // время с момента отпускания (окно double click)
+
+    // Флаги состояний
+    logic [11:0] waiting_dbl;    // ждём повторное нажатие
+    logic [11:0] long_reported;  // long press уже отрапортован (чтобы не спамить)
+
+    // Флаг события двойного нажатия (импульс на 1 такт)
+    logic [11:0] dbl_event;
+
+    // -------------------------------------------------------------------------
+    // 8.1. Детектор фронтов кнопок
+    // -------------------------------------------------------------------------
+    always_ff @(posedge clk) begin
+        if (!rst_n)
+            prev_btn <= '0;
+        else
+            prev_btn <= gp_status[11:0];
+    end
+
+    // Нажатие: было 0, стало 1
+    assign press_edge   = gp_status[11:0] & ~prev_btn;
+    // Отпускание: было 1, стало 0
+    assign release_edge = ~gp_status[11:0] & prev_btn;
+
+    // -------------------------------------------------------------------------
+    // 8.2. Таймер удержания и счётчик окна двойного нажатия (для каждой кнопки)
+    // -------------------------------------------------------------------------
+    genvar i;
+    generate
+        for (i = 0; i < 12; i = i + 1) begin : gen_btn_logic
+
+            // --- Таймер удержания ---
+            always_ff @(posedge clk) begin
+                if (!rst_n) begin
+                    hold_timer[i] <= '0;
+                end else if (press_edge[i]) begin
+                    hold_timer[i] <= '0;                // Начало нового удержания
+                end else if (gp_status[i]) begin
+                    if (hold_timer[i] < LONG_PRESS_US)
+                        hold_timer[i] <= hold_timer[i] + 1;
+                end else begin
+                    hold_timer[i] <= '0;                // Кнопка отпущена
+                end
+            end
+
+            // --- Счётчик окна двойного нажатия ---
+            // Запускается при отпускании (если это было одиночное нажатие)
+            // и считает DOUBLE_CLICK_US мкс после отпускания.
+            always_ff @(posedge clk) begin
+                if (!rst_n) begin
+                    dbl_timer[i] <= '0;
+                end else if (release_edge[i]) begin
+                    dbl_timer[i] <= '0;                 // Старт окна после отпускания
+                end else if (waiting_dbl[i]) begin
+                    if (dbl_timer[i] < DOUBLE_CLICK_US)
+                        dbl_timer[i] <= dbl_timer[i] + 1;
+                end
+            end
+
+            // --- Флаг «ждём второе нажатие» ---
+            // Взводится при отпускании (если кнопка была нажата не «long»),
+            // сбрасывается, если окно истекло или произошло второе нажатие.
+            always_ff @(posedge clk) begin
+                if (!rst_n) begin
+                    waiting_dbl[i] <= 1'b0;
+                end else if (press_edge[i] && waiting_dbl[i]) begin
+                    // Второе нажатие в окне — двойной клик!
+                    waiting_dbl[i] <= 1'b0;
+                end else if (release_edge[i] && !long_reported[i]) begin
+                    // Обычное короткое нажатие — открываем окно ожидания
+                    waiting_dbl[i] <= 1'b1;
+                end else if (waiting_dbl[i] && (dbl_timer[i] >= DOUBLE_CLICK_US)) begin
+                    // Окно истекло — второго нажатия не было
+                    waiting_dbl[i] <= 1'b0;
+                end
+            end
+
+            // --- Импульс события двойного нажатия ---
+            assign dbl_event[i] = press_edge[i] && waiting_dbl[i];
+
+            // --- Флаг «длительное нажатие уже отрапортовано» ---
+            always_ff @(posedge clk) begin
+                if (!rst_n)
+                    long_reported[i] <= 1'b0;
+                else if (press_edge[i])
+                    long_reported[i] <= 1'b0;             // Новое нажатие — сбрасываем
+                else if (hold_timer[i] >= LONG_PRESS_US)
+                    long_reported[i] <= 1'b1;             // Порог достигнут — рапортуем один раз
+            end
+
+        end
+    endgenerate
+
+    // -------------------------------------------------------------------------
+    // 8.3. Формирование interrupt_flag (R/W1C) и его сброс по записи 1
+    // -------------------------------------------------------------------------
+    // Пользовательские события:
+    //   - длительное нажатие: момент, когда hold_timer достигает порога
+    //   - двойное нажатие:     импульс dbl_event
+    // Оба события выставляют соответствующий бит в interrupt_flag.
+    // Сброс бита выполняется записью 1 из AXI-Lite (порт interrupt_clear).
+    //
+    // ВАЖНО: модуль не знает про AXI. Для сброса флагов из ПО
+    // нужно добавить вход interrupt_clear[11:0] и подать на него
+    // сигнал записи из AXI-модуля. Ниже — заглушка, которую
+    // следует подключить к регистру INTERRUPT (W1C).
+
+    // Внутренние импульсы событий long press
+    logic [11:0] long_event;
+    generate
+        for (i = 0; i < 12; i = i + 1) begin : gen_long_event
+            assign long_event[i] = (hold_timer[i] == LONG_PRESS_US);
+        end
+    endgenerate
+
+    // Вход сброса флагов (подключить к AXI-регистру W1C)
+    // По умолчанию — нет сброса; в реальном дизайне подать сюда
+    // slv_reg3 (биты, записанные 1, сбрасывают соответствующий флаг).
+    // Здесь объявлен внутренний сигнал-заглушка.
+    logic [11:0] interrupt_clear;
+    assign interrupt_clear = '0; // TODO: подключить к AXI W1C
+
+    // Регистр флагов прерываний (R/W1C)
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            interrupt_flag <= '0;
+        end else begin
+            // Сброс по записи 1 (W1C) имеет приоритет
+            for (int k = 0; k < 12; k++) begin
+                if (interrupt_clear[k])
+                    interrupt_flag[k] <= 1'b0;
+                else if (long_event[k] || dbl_event[k])
+                    interrupt_flag[k] <= 1'b1; // Установка события
+            end
+        end
+    end
+
+endmodule
