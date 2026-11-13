@@ -1,0 +1,426 @@
+OPT_MEM_ADDR_BITS = 1 — помечено <<< ПРОВЕРЬТЕ. Для 4 регистров и 32-битной шины это стандартное значение, но в некоторых версиях Vivado генератор ставит 2'h3 (что является ошибкой генератора). Если у вас в исходном файле было иначе — приведите к 1.
+
+ADDR_LSB — для 32-битной шины всегда 2, менять не нужно.
+
+CORE_VERSION[7:0] — версия передаётся из параметра (как в Листинге 7 методички), а не хардкодится. При упаковке IP значение можно будет менять через Customization Parameters.
+
+W1C для slv_reg3 — реализован строкой slv_reg3 <= slv_reg3 & ~S_AXI_WDATA;. Для полноценного прерывания нужно будет в SEGAGamePad_logic.v сформировать сигнал установки флага (детектор фронта кнопки) и добавить его как вход в этот модуль — это дополнительное задание.
+
+`timescale 1 ns / 1 ps
+
+module SEGAGamePad_slave_lite_v1_0_S00_AXI #
+(
+    // Пользовательские параметры
+    parameter integer CORE_VERSION = 1,
+    // Конец пользовательских параметров
+
+    // Ширина шины данных S_AXI
+    parameter integer C_S_AXI_DATA_WIDTH  = 32,
+    // Ширина шины адреса S_AXI
+    parameter integer C_S_AXI_ADDR_WIDTH  = 4
+)
+(
+    // Пользовательские порты
+    input  wire [31:0] gp_status,   // Вход: состояние кнопок из логического модуля
+    output wire        polling,     // Выход: сигнал включения автоопроса
+    output wire        select,      // Выход: сигнал ручного управления Select
+    output wire        interrupt,   // Выход: сигнал прерывания на процессор
+    // Конец пользовательских портов
+
+    // Глобальный тактовый сигнал
+    input wire  S_AXI_ACLK,
+    // Глобальный сигнал сброса (активный низкий уровень)
+    input wire  S_AXI_ARESETN,
+    // Адрес записи (выдаётся мастером, принимается слейвом)
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_AWADDR,
+    // Тип защиты канала записи (привилегии, безопасность, доступ к данным/инструкциям)
+    input wire [2 : 0] S_AXI_AWPROT,
+    // Валидность адреса записи: мастер выставил корректный адрес и управляющую информацию
+    input wire  S_AXI_AWVALID,
+    // Готовность принять адрес записи: слейв готов принять адрес и управляющие сигналы
+    output wire  S_AXI_AWREADY,
+    // Данные записи (выдаются мастером, принимаются слейвом)
+    input wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_WDATA,
+    // Стробы записи: определяют, какие байтовые линии данных валидны
+    input wire [(C_S_AXI_DATA_WIDTH/8)-1 : 0] S_AXI_WSTRB,
+    // Валидность данных записи: данные и стробы выставлены
+    input wire  S_AXI_WVALID,
+    // Готовность принять данные записи: слейв может принять данные
+    output wire  S_AXI_WREADY,
+    // Ответ на запись: статус завершения транзакции записи
+    output wire [1 : 0] S_AXI_BRESP,
+    // Валидность ответа на запись: слейв сигнализирует о готовом ответе
+    output wire  S_AXI_BVALID,
+    // Готовность принять ответ: мастер может принять ответ на запись
+    input wire  S_AXI_BREADY,
+    // Адрес чтения (выдаётся мастером, принимается слейвом)
+    input wire [C_S_AXI_ADDR_WIDTH-1 : 0] S_AXI_ARADDR,
+    // Тип защиты канала чтения
+    input wire [2 : 0] S_AXI_ARPROT,
+    // Валидность адреса чтения
+    input wire  S_AXI_ARVALID,
+    // Готовность принять адрес чтения: слейв готов принять адрес и управляющие сигналы
+    output wire  S_AXI_ARREADY,
+    // Данные чтения (выдаются слейвом)
+    output wire [C_S_AXI_DATA_WIDTH-1 : 0] S_AXI_RDATA,
+    // Ответ на чтение: статус завершения транзакции чтения
+    output wire [1 : 0] S_AXI_RRESP,
+    // Валидность данных чтения: слейв выставил корректные данные
+    output wire  S_AXI_RVALID,
+    // Готовность принять данные чтения: мастер может принять данные
+    input wire  S_AXI_RREADY
+);
+
+    // Внутренние сигналы AXI4-Lite
+    reg [C_S_AXI_ADDR_WIDTH-1 : 0] axi_awaddr;   // Защёлкнутый адрес записи
+    reg  axi_awready;                            // Готовность принять адрес записи
+    reg  axi_wready;                             // Готовность принять данные записи
+    reg [1 : 0] axi_bresp;                       // Ответ на запись
+    reg  axi_bvalid;                             // Валидность ответа на запись
+    reg [C_S_AXI_ADDR_WIDTH-1 : 0] axi_araddr;   // Защёлкнутый адрес чтения
+    reg  axi_arready;                            // Готовность принять адрес чтения
+    reg [1 : 0] axi_rresp;                       // Ответ на чтение
+    reg  axi_rvalid;                             // Валидность данных чтения
+
+    // Локальные параметры для адресации
+    // ADDR_LSB = 2 для 32-битной шины (адресация с шагом 4 байта)
+    // ADDR_LSB = 3 для 64-битной шины
+    localparam integer ADDR_LSB = (C_S_AXI_DATA_WIDTH/32) + 1;
+    localparam integer OPT_MEM_ADDR_BITS = 1; // <<< ПРОВЕРЬТЕ (для 4 регистров = 1)
+
+    // Сигналы для пользовательских регистров
+    // Количество слейв-регистров: 4
+    reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg0;   // 0x00 VERSION   (RO)
+    reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg1;   // 0x04 CONTROL   (RW)
+    reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg2;   // 0x08 STATUS    (RO)
+    reg [C_S_AXI_DATA_WIDTH-1:0] slv_reg3;   // 0x0C INTERRUPT (W1C)
+
+    wire  slv_reg_rden;                      // Разрешение чтения регистров
+    wire  slv_reg_wren;                      // Разрешение записи регистров
+    reg [C_S_AXI_DATA_WIDTH-1:0] reg_data_out; // Мультиплексированные данные для чтения
+    integer byte_index;                      // Индекс байта для стробы записи
+    reg  aw_en;                              // Разрешение транзакции записи
+
+    // Связывание внутренних сигналов с портами
+    assign S_AXI_AWREADY = axi_awready;
+    assign S_AXI_WREADY  = axi_wready;
+    assign S_AXI_BRESP   = axi_bresp;
+    assign S_AXI_BVALID  = axi_bvalid;
+    assign S_AXI_ARREADY = axi_arready;
+    assign S_AXI_RRESP   = axi_rresp;
+    assign S_AXI_RVALID  = axi_rvalid;
+
+    // ------------------------------------------------------------
+    // Формирование axi_awready
+    // axi_awready выставляется на один такт S_AXI_ACLK, когда
+    // одновременно активны S_AXI_AWVALID и S_AXI_WVALID.
+    // Снимается при сбросе.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_awready <= 1'b0;
+            aw_en <= 1'b1;
+        end
+        else
+        begin
+            if (~axi_awready && S_AXI_AWVALID && S_AXI_WVALID && aw_en)
+            begin
+                // Слейв готов принять адрес записи, когда есть валидный
+                // адрес и данные. Дизайн не поддерживает несколько
+                // одновременно выдающихся транзакций.
+                axi_awready <= 1'b1;
+                aw_en <= 1'b0;
+            end
+            else if (S_AXI_BREADY && axi_bvalid)
+            begin
+                aw_en <= 1'b1;
+                axi_awready <= 1'b0;
+            end
+            else
+            begin
+                axi_awready <= 1'b0;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Защёлкивание адреса записи
+    // Адрес защёлкивается, когда одновременно активны
+    // S_AXI_AWVALID и S_AXI_WVALID.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_awaddr <= 0;
+        end
+        else
+        begin
+            if (~axi_awready && S_AXI_AWVALID && S_AXI_WVALID && aw_en)
+            begin
+                // Защёлкивание адреса записи
+                axi_awaddr <= S_AXI_AWADDR;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Формирование axi_wready
+    // axi_wready выставляется на один такт S_AXI_ACLK, когда
+    // одновременно активны S_AXI_AWVALID и S_AXI_WVALID.
+    // Снимается при сбросе.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_wready <= 1'b0;
+        end
+        else
+        begin
+            if (~axi_wready && S_AXI_WVALID && S_AXI_AWVALID && aw_en )
+            begin
+                // Слейв готов принять данные записи, когда есть валидный
+                // адрес и данные. Дизайн не поддерживает несколько
+                // одновременно выдающихся транзакций.
+                axi_wready <= 1'b1;
+            end
+            else
+            begin
+                axi_wready <= 1'b0;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Запись в регистры по адресу
+    // Данные принимаются и записываются в регистры, когда
+    // axi_awready, S_AXI_WVALID, axi_wready и S_AXI_WVALID активны.
+    // Стробы записи выбирают, какие байты регистра обновляются.
+    // Все регистры сбрасываются при активном низком уровне сброса.
+    //
+    // ВАЖНО (по методичке, стр. 9): запись разрешена только в
+    // slv_reg1 (CONTROL) и slv_reg3 (INTERRUPT).
+    // slv_reg0 (VERSION) и slv_reg2 (STATUS) — только чтение.
+    //
+    // Для slv_reg3 реализован режим W1C (запись 1 сбрасывает бит).
+    // ------------------------------------------------------------
+    assign slv_reg_wren = axi_wready && S_AXI_WVALID && axi_awready && S_AXI_AWVALID;
+
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            slv_reg1 <= 0;
+            slv_reg3 <= 0;
+        end
+        else begin
+            if (slv_reg_wren)
+            begin
+                case ( axi_awaddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
+                    2'h1: // 0x04 CONTROL — обычная запись побайтно
+                        for ( byte_index = 0; byte_index <= (C_S_AXI_DATA_WIDTH/8)-1; byte_index = byte_index+1 )
+                            if ( S_AXI_WSTRB[byte_index] == 1 ) begin
+                                // Стробы записи разрешают соответствующие байты
+                                slv_reg1[(byte_index*8) +: 8] <= S_AXI_WDATA[(byte_index*8) +: 8];
+                            end
+                    2'h3: // 0x0C INTERRUPT — W1C: запись 1 сбрасывает бит
+                        slv_reg3 <= slv_reg3 & ~S_AXI_WDATA;
+                    default: begin
+                        slv_reg1 <= slv_reg1;
+                        slv_reg3 <= slv_reg3;
+                    end
+                endcase
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Формирование ответа на запись
+    // Ответ (BRESP и BVALID) формируется на один такт S_AXI_ACLK
+    // после завершения транзакции записи. Дизайн не поддерживает
+    // несколько одновременно выдающихся транзакций.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_bvalid  <= 0;
+            axi_bresp   <= 2'b0;
+        end
+        else
+        begin
+            if (axi_awready && S_AXI_AWVALID && ~axi_bvalid && axi_wready && S_AXI_WVALID)
+            begin
+                // Валидный ответ на запись доступен
+                axi_bvalid <= 1'b1;
+                axi_bresp  <= 2'b0; // ответ 'OKAY'
+            end
+            else
+            begin
+                if (S_AXI_BREADY && axi_bvalid)
+                // Проверка: bready активен, пока bvalid в высоком уровне
+                // (возможен случай, когда bready всегда в высоком уровне)
+                begin
+                    axi_bvalid <= 1'b0;
+                end
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Формирование axi_arready
+    // axi_arready выставляется на один такт S_AXI_ACLK, когда
+    // активен S_AXI_ARVALID. Снимается при сбросе.
+    // Адрес чтения защёлкивается, когда S_AXI_ARVALID активен.
+    // axi_araddr сбрасывается в ноль при сбросе.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_arready <= 1'b0;
+            axi_araddr  <= 32'b0;
+        end
+        else
+        begin
+            if (~axi_arready && S_AXI_ARVALID)
+            begin
+                // Слейв принял валидный адрес чтения
+                axi_arready <= 1'b1;
+                // Защёлкивание адреса чтения
+                axi_araddr  <= S_AXI_ARADDR;
+            end
+            else
+            begin
+                axi_arready <= 1'b0;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Формирование axi_rvalid
+    // axi_rvalid выставляется на один такт S_AXI_ACLK, когда
+    // одновременно активны S_AXI_ARVALID и axi_arready.
+    // В этот момент данные слейв-регистров доступны на шине axi_rdata.
+    // Утверждение axi_rvalid означает валидность данных чтения,
+    // а axi_rresp — статус транзакции чтения.
+    // axi_rvalid, axi_rresp и axi_rdata сбрасываются при сбросе.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            axi_rvalid <= 0;
+            axi_rresp  <= 0;
+        end
+        else
+        begin
+            if (axi_arready && S_AXI_ARVALID && ~axi_rvalid)
+            begin
+                // Валидные данные чтения доступны на шине
+                axi_rvalid <= 1'b1;
+                axi_rresp  <= 2'b0; // ответ 'OKAY'
+            end
+            else if (axi_rvalid && S_AXI_RREADY)
+            begin
+                // Данные чтения приняты мастером
+                axi_rvalid <= 1'b0;
+            end
+        end
+    end
+
+    // ------------------------------------------------------------
+    // Мультиплексирование данных для чтения
+    // Разрешение чтения регистров активно, когда есть валидный
+    // адрес и слейв готов принять адрес чтения.
+    // ------------------------------------------------------------
+    assign slv_reg_rden = axi_arready & S_AXI_ARVALID & ~axi_rvalid;
+    always @(*)
+    begin
+        // Декодирование адреса для чтения регистров
+        case ( axi_araddr[ADDR_LSB+OPT_MEM_ADDR_BITS:ADDR_LSB] )
+            2'h0   : reg_data_out <= slv_reg0;
+            2'h1   : reg_data_out <= slv_reg1;
+            2'h2   : reg_data_out <= slv_reg2;
+            2'h3   : reg_data_out <= slv_reg3;
+            default: reg_data_out <= 0;
+        endcase
+    end
+
+    // ------------------------------------------------------------
+    // Выдача данных чтения
+    // При наличии валидного адреса чтения (S_AXI_ARVALID) и
+    // готовности слейва (axi_arready) на шину выдаются данные.
+    // ------------------------------------------------------------
+    always @( posedge S_AXI_ACLK )
+    begin
+        if ( S_AXI_ARESETN == 1'b0 )
+        begin
+            S_AXI_RDATA <= 0;
+        end
+        else
+        begin
+            if (slv_reg_rden)
+            begin
+                S_AXI_RDATA <= reg_data_out;     // Данные для чтения
+            end
+        end
+    end
+
+    // ============================================================
+    // Пользовательская логика
+    // ============================================================
+
+    // --------------------------------------------------------
+    // 1. Регистр VERSION (0x00) — только чтение
+    // --------------------------------------------------------
+    // Версия ядра задаётся параметром CORE_VERSION (младшие 8 бит).
+    always @(posedge S_AXI_ACLK)
+    begin
+        if (S_AXI_ARESETN == 1'b0)
+            slv_reg0 <= {{(32-8){1'b0}}, CORE_VERSION[7:0]};
+        else
+            slv_reg0 <= {{(32-8){1'b0}}, CORE_VERSION[7:0]};
+    end
+
+    // --------------------------------------------------------
+    // 2. Регистр CONTROL (0x04) — управление
+    // --------------------------------------------------------
+    // Бит 0 (EN) — разрешение работы
+    // Бит 1 (P)  — непрерывный опрос (polling)
+    // Бит 2 (SL) — ручное управление Select (select)
+    // Бит 3 (IE) — разрешение прерываний
+    assign polling = slv_reg1[1] & slv_reg1[0]; // Опрос работает только если EN=1 и P=1
+    assign select  = slv_reg1[2] & slv_reg1[0]; // Ручной Select работает только если EN=1 и SL=1
+
+    // --------------------------------------------------------
+    // 3. Регистр STATUS (0x08) — только чтение (состояние кнопок)
+    // --------------------------------------------------------
+    // Состояние кнопок из логического модуля передаётся в регистр.
+    always @(posedge S_AXI_ACLK)
+    begin
+        if (S_AXI_ARESETN == 1'b0)
+            slv_reg2 <= 32'h0000_0000;
+        else
+            slv_reg2 <= gp_status;
+    end
+
+    // --------------------------------------------------------
+    // 4. Регистр INTERRUPT (0x0C) — прерывания (W1C)
+    // --------------------------------------------------------
+    // Упрощённая реализация: флаг slv_reg3[0] взводится из логики
+    // (дополнительное задание — детекторы фронта кнопок),
+    // а сброс — записью 1 из процессора (см. ветку 2'h3 в блоке записи).
+    //
+    // interrupt = флаг & разрешение IE.
+    // Для базового варианта оставляем только разрешение:
+    assign interrupt = slv_reg3[0] & slv_reg1[3];
+
+    // ============================================================
+    // Конец пользовательской логики
+    // ============================================================
+
+endmodule
