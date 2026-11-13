@@ -1,0 +1,217 @@
+module SEGAGamePad_logic
+#(
+    // Количество тактов clk для отсчета одной мкс (при частоте 150 МГц)
+    DELAY_US_TICKS = 150
+)
+(
+    input  logic clk,
+    input  logic rst_n,
+
+    // Режим непрерывного опроса (из регистра CONTROL)
+    input  logic polling,
+    // Управление сигналом sel в ручном режиме (из регистра CONTROL)
+    input  logic select,
+
+    // Интерфейс с GamePad (физические линии)
+    input  logic gp_up_z,
+    input  logic gp_down_y,
+    input  logic gp_left_x,
+    input  logic gp_right_mode,
+    input  logic gp_c_start,
+    input  logic gp_b_a,
+    
+    // Выходной сигнал Select
+    output logic gp_sel,
+    
+    // Статусный регистр (состояние кнопок)
+    output logic [31:0] gp_status
+);
+
+    // ==========================================================
+    // 1. Нумерация разрядов регистра статуса (биты кнопок)
+    // ==========================================================
+    typedef enum {
+        UP_BTN = 0, DOWN_BTN, LEFT_BTN, RIGHT_BTN,
+        A_BTN, B_BTN, C_BTN, START_BTN, MODE_BTN,
+        X_BTN, Y_BTN, Z_BTN
+    } BUTTON_t;
+
+    // ==========================================================
+    // 2. Объявление FSM (ПЕРЕМЕЩЕНО ВВЕРХ для избежания ошибки)
+    // ==========================================================
+    typedef enum {
+        IDEL,       // Ожидание
+        WAIT_LOW,   // Установка Select = 0 и ожидание 20 мкс
+        READ_LOW,   // Чтение кнопок при Select = 0
+        WAIT_HIGH,  // Установка Select = 1 и ожидание 20 мкс
+        READ_HIGH   // Чтение кнопок при Select = 1
+    } gp_read_state_t;
+
+    gp_read_state_t state, next_state;
+
+    // ==========================================================
+    // 3. Параметры задержек и счетчиков
+    // ==========================================================
+    localparam int C_WAIT_DELAY = 20;                 // Время установки сигнала Select: 20 мкс
+    localparam int C_POLLING_DELAY = 10000 / C_WAIT_DELAY; // Пауза между опросами: 10 мс (10000 мкс)
+
+    // Счетчики
+    logic [$bits(DELAY_US_TICKS)-1 : 0] us_counter;     // Счетчик тактов для 1 мкс
+    logic [$bits(C_WAIT_DELAY)-1 : 0] dly_counter;      // Счетчик 20 мкс
+    logic [$bits(C_POLLING_DELAY)-1 : 0] polling_counter; // Счетчик 10 мс
+
+    // Импульсы переполнения счетчиков (длительностью 1 такт)
+    logic counter_us_pulse;
+    logic dly_pulse;
+    logic polling_pulse;
+
+    // ==========================================================
+    // 4. Логика работы счетчиков
+    // ==========================================================
+    
+    // Счетчик микросекунд
+    always_ff @(posedge clk) begin : us_counter_alw
+        if (!rst_n) begin
+            us_counter <= '0;
+        end else if (us_counter == DELAY_US_TICKS - 1) begin
+            us_counter <= '0; // Сброс после отсчета 1 мкс
+        end else begin
+            us_counter <= us_counter + 1'b1;
+        end
+    end
+
+    // Импульс каждую 1 мкс
+    assign counter_us_pulse = (us_counter == DELAY_US_TICKS - 1);
+
+    // Счетчик задержки установки (20 мкс)
+    always_ff @(posedge clk) begin : dly_counter_alw
+        if (!rst_n) begin
+            dly_counter <= '0;
+        end else if (counter_us_pulse) begin
+            if (dly_counter == C_WAIT_DELAY - 1) begin
+                dly_counter <= '0; // Сброс после 20 мкс
+            end else begin
+                dly_counter <= dly_counter + 1'b1;
+            end
+        end
+    end
+
+    // Импульс, когда 20 мкс истекли (срабатывает 1 такт каждые 20 мкс)
+    assign dly_pulse = (dly_counter == C_WAIT_DELAY - 1) && counter_us_pulse;
+
+    // Счетчик паузы между опросами (10 мс)
+    always_ff @(posedge clk) begin : polling_counter_alw
+        if (!rst_n) begin
+            polling_counter <= '0;
+        end else if (dly_pulse && (state == IDEL)) begin // Считаем паузу только в состоянии IDEL
+            if (polling_counter == C_POLLING_DELAY - 1) begin
+                polling_counter <= '0;
+            end else begin
+                polling_counter <= polling_counter + 1'b1;
+            end
+        end
+    end
+
+    // Импульс, когда пауза между опросами (10 мс) истекла
+    assign polling_pulse = (polling_counter == C_POLLING_DELAY - 1) && dly_pulse && (state == IDEL);
+
+    // ==========================================================
+    // 5. Конечный автомат (FSM) управления опросом GamePad
+    // ==========================================================
+    // Регистр текущего состояния
+    always_ff @(posedge clk) begin
+        if (!rst_n) state <= IDEL;
+        else        state <= next_state;
+    end
+
+    // Комбинационная логика переходов
+    always_comb begin : next_state_alw
+        next_state = state; // По умолчанию остаемся в том же состоянии
+        case (state)
+            IDEL: begin
+                if (polling && polling_pulse) // Если включен непрерывный опрос и пауза прошла
+                    next_state = WAIT_LOW;
+                else if (!polling && select)  // Или если ручной режим и select = 1
+                    next_state = WAIT_HIGH;
+                else if (!polling && !select) // Или если ручной режим и select = 0
+                    next_state = WAIT_LOW;
+            end
+            WAIT_LOW: begin
+                if (dly_pulse) next_state = READ_LOW; // Ждем 20 мкс
+            end
+            READ_LOW: begin
+                next_state = WAIT_HIGH; // Сразу переходим к установке 1
+            end
+            WAIT_HIGH: begin
+                if (dly_pulse) next_state = READ_HIGH; // Ждем 20 мкс
+            end
+            READ_HIGH: begin
+                if (polling) next_state = IDEL; // Если непрерывный опрос — начинаем заново
+                else next_state = IDEL;         // Если ручной режим — тоже в IDEL
+            end
+            default: next_state = IDEL;
+        endcase
+    end
+
+    // ==========================================================
+    // 6. Управление сигналом Select
+    // ==========================================================
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            gp_sel <= '0;
+        end else begin
+            if (polling) begin
+                // В режиме непрерывного опроса управляем автоматически
+                if (state == WAIT_LOW)       gp_sel <= '0; //автомат ставит 0
+                else if (state == WAIT_HIGH) gp_sel <= '1;
+            end else begin
+                // В ручном режиме берем значение из регистра select
+                gp_sel <= select;
+            end
+        end
+    end
+
+    // ==========================================================
+    // 7. Захват значений кнопок (чтение)
+    // ==========================================================
+    always_ff @(posedge clk) begin : read_btn_alw
+        if (!rst_n) begin
+            gp_status <= '0;
+        end else begin
+            case (state)
+                READ_LOW: begin
+                    // Чтение кнопок, активных при Select = 0
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[A_BTN]     <= ~gp_b_a;
+                    gp_status[START_BTN] <= ~gp_c_start;
+                end
+                READ_HIGH: begin
+                    // Чтение кнопок, активных при Select = 1
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[LEFT_BTN]  <= ~gp_left_x;
+                    gp_status[RIGHT_BTN] <= ~gp_right_mode;
+                    gp_status[B_BTN]     <= ~gp_b_a;
+                    gp_status[C_BTN]     <= ~gp_c_start;
+                end
+                default: begin
+                    // В остальных состояниях сохраняем предыдущее значение
+                    gp_status <= gp_status;
+                end
+            endcase
+
+            // Захват "сырых" значений линий (биты 21:16)
+            // Полезно для отладки через ILA
+            gp_status[21:16] <= {
+                gp_c_start,
+                gp_b_a,
+                gp_right_mode,
+                gp_left_x,
+                gp_down_y,
+                gp_up_z
+            };
+        end
+    end
+
+endmodule
