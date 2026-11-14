@@ -1,0 +1,66 @@
+// ============================================================
+// Внутренние сигналы связи между AXI-модулем и логикой
+// ============================================================
+wire [31:0] gp_status;   // статус кнопок: logic -> AXI (в регистр STATUS)
+wire        polling;     // режим опроса: AXI (CONTROL) -> logic
+wire        select;      // ручное управление sel: AXI (CONTROL) -> logic
+
+// ============================================================
+// Экземпляр AXI-интерфейса (сгенерирован Vivado + правки)
+// ============================================================
+SEGAGamePad_slave_lite_v1_0_S00_AXI #(
+    .C_S00_AXI_DATA_WIDTH (C_S00_AXI_DATA_WIDTH),
+    .C_S00_AXI_ADDR_WIDTH (C_S00_AXI_ADDR_WIDTH),
+    .CORE_VERSION         (CORE_VERSION)
+) axi_inst (
+    .s00_axi_aclk    (s00_axi_aclk),
+    .s00_axi_aresetn (s00_axi_aresetn),
+    .s00_axi_awaddr  (s00_axi_awaddr),
+    .s00_axi_awprot  (s00_axi_awprot),
+    .s00_axi_awvalid (s00_axi_awvalid),
+    .s00_axi_awready (s00_axi_awready),
+    .s00_axi_wdata   (s00_axi_wdata),
+    .s00_axi_wstrb   (s00_axi_wstrb),
+    .s00_axi_wvalid  (s00_axi_wvalid),
+    .s00_axi_wready  (s00_axi_wready),
+    .s00_axi_bresp   (s00_axi_bresp),
+    .s00_axi_bvalid  (s00_axi_bvalid),
+    .s00_axi_bready  (s00_axi_bready),
+    .s00_axi_araddr  (s00_axi_araddr),
+    .s00_axi_arprot  (s00_axi_arprot),
+    .s00_axi_arvalid (s00_axi_arvalid),
+    .s00_axi_arready (s00_axi_arready),
+    .s00_axi_rdata   (s00_axi_rdata),
+    .s00_axi_rresp   (s00_axi_rresp),
+    .s00_axi_rvalid  (s00_axi_rvalid),
+    .s00_axi_rready  (s00_axi_rready),
+
+    // ---- Пользовательские порты (добавлены вами) ----
+    .gp_status (gp_status),
+    .polling   (polling),
+    .select    (select),
+    .interrupt (interrupt)
+);
+
+// ============================================================
+// Экземпляр логики GamePad
+// ============================================================
+SEGAGamePad_logic #(
+    .DELAY_US_TICKS (DELAY_US_TICKS)
+) logic_inst (
+    .clk           (s00_axi_aclk),
+    .rst_n         (s00_axi_aresetn),
+
+    .polling       (polling),
+    .select        (select),
+
+    .gp_up_z       (gp_up_z),
+    .gp_down_y     (gp_down_y),
+    .gp_left_x     (gp_left_x),
+    .gp_right_mode (gp_right_mode),
+    .gp_c_start    (gp_c_start),
+    .gp_b_a        (gp_b_a),
+
+    .gp_sel        (gp_sel),
+    .gp_status     (gp_status)
+);
