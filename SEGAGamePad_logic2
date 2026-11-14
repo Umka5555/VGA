@@ -1,0 +1,205 @@
+`timescale 1ns / 1ps
+
+module SEGAGamePad_logic
+#(
+    // Количество тактов clk для отсчета одной мкс (при частоте 150 МГц)
+    parameter DELAY_US_TICKS = 150
+)
+(
+    input  wire clk,
+    input  wire rst_n,
+
+    // Режим непрерывного опроса (из регистра CONTROL)
+    input  wire polling,
+    // Управление сигналом sel в ручном режиме (из регистра CONTROL)
+    input  wire select,
+
+    // Интерфейс с GamePad (физические линии)
+    input  wire gp_up_z,
+    input  wire gp_down_y,
+    input  wire gp_left_x,
+    input  wire gp_right_mode,
+    input  wire gp_c_start,
+    input  wire gp_b_a,
+    
+    // Выходной сигнал Select
+    output reg  gp_sel,
+    
+    // Статусный регистр (состояние кнопок)
+    output reg [31:0] gp_status
+);
+
+    // ==========================================================
+    // 1. Нумерация разрядов регистра статуса (биты кнопок)
+    // ==========================================================
+    localparam UP_BTN    = 0;
+    localparam DOWN_BTN  = 1;
+    localparam LEFT_BTN  = 2;
+    localparam RIGHT_BTN = 3;
+    localparam A_BTN     = 4;
+    localparam B_BTN     = 5;
+    localparam C_BTN     = 6;
+    localparam START_BTN = 7;
+    localparam MODE_BTN  = 8;
+
+    // ==========================================================
+    // 2. Параметры задержек и счетчиков
+    // ==========================================================
+    localparam C_WAIT_DELAY = 20;                 // Время установки сигнала Select: 20 мкс
+    localparam C_POLLING_DELAY = 10000 / C_WAIT_DELAY; // Пауза между опросами: 10 мс (10000 мкс)
+
+    // Счетчики
+    reg [15:0] us_counter;     // Счетчик тактов для 1 мкс
+    reg [7:0]  dly_counter;    // Счетчик 20 мкс
+    reg [15:0] polling_counter; // Счетчик 10 мс
+
+    // Импульсы переполнения счетчиков
+    wire counter_us_pulse;
+    wire dly_pulse;
+    wire polling_pulse;
+
+    // ==========================================================
+    // 3. Логика работы счетчиков
+    // ==========================================================
+    
+    // Счетчик микросекунд
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            us_counter <= 16'd0;
+        end else if (us_counter == DELAY_US_TICKS - 1) begin
+            us_counter <= 16'd0; 
+        end else begin
+            us_counter <= us_counter + 1'b1;
+        end
+    end
+
+    assign counter_us_pulse = (us_counter == DELAY_US_TICKS - 1);
+
+    // Счетчик задержки установки (20 мкс)
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            dly_counter <= 8'd0;
+        end else if (counter_us_pulse) begin
+            if (dly_counter == C_WAIT_DELAY - 1) begin
+                dly_counter <= 8'd0; 
+            end else begin
+                dly_counter <= dly_counter + 1'b1;
+            end
+        end
+    end
+
+    assign dly_pulse = (dly_counter == C_WAIT_DELAY - 1) && counter_us_pulse;
+
+    // ==========================================================
+    // 4. Конечный автомат (FSM)
+    // ==========================================================
+    localparam IDEL      = 3'd0;
+    localparam WAIT_LOW  = 3'd1;
+    localparam READ_LOW  = 3'd2;
+    localparam WAIT_HIGH = 3'd3;
+    localparam READ_HIGH = 3'd4;
+
+    reg [2:0] state, next_state;
+
+    // Регистр текущего состояния
+    always @(posedge clk) begin
+        if (!rst_n) state <= IDEL;
+        else        state <= next_state;
+    end
+
+    // Комбинационная логика переходов
+    always @(*) begin
+        next_state = state; 
+        case (state)
+            IDEL: begin
+                if (polling && polling_pulse) 
+                    next_state = WAIT_LOW;
+                else if (!polling && select)  
+                    next_state = WAIT_HIGH;
+                else if (!polling && !select) 
+                    next_state = WAIT_LOW;
+            end
+            WAIT_LOW: begin
+                if (dly_pulse) next_state = READ_LOW; 
+            end
+            READ_LOW: begin
+                next_state = WAIT_HIGH; 
+            end
+            WAIT_HIGH: begin
+                if (dly_pulse) next_state = READ_HIGH; 
+            end
+            READ_HIGH: begin
+                next_state = IDEL; 
+            end
+            default: next_state = IDEL;
+        endcase
+    end
+
+    // Счетчик паузы между опросами (10 мс)
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            polling_counter <= 16'd0;
+        end else if (dly_pulse && (state == IDEL)) begin 
+            if (polling_counter == C_POLLING_DELAY - 1) begin
+                polling_counter <= 16'd0;
+            end else begin
+                polling_counter <= polling_counter + 1'b1;
+            end
+        end
+    end
+
+    assign polling_pulse = (polling_counter == C_POLLING_DELAY - 1) && dly_pulse && (state == IDEL);
+
+    // ==========================================================
+    // 5. Управление сигналом Select
+    // ==========================================================
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            gp_sel <= 1'b0;
+        end else begin
+            if (polling) begin
+                if (state == WAIT_LOW)       gp_sel <= 1'b0;
+                else if (state == WAIT_HIGH) gp_sel <= 1'b1;
+            end else begin
+                gp_sel <= select;
+            end
+        end
+    end
+
+    // ==========================================================
+    // 6. Захват значений кнопок (чтение)
+    // ==========================================================
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            gp_status <= 32'd0;
+        end else begin
+            case (state)
+                READ_LOW: begin
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[A_BTN]     <= ~gp_b_a;
+                    gp_status[START_BTN] <= ~gp_c_start;
+                end
+                READ_HIGH: begin
+                    gp_status[UP_BTN]    <= ~gp_up_z;
+                    gp_status[DOWN_BTN]  <= ~gp_down_y;
+                    gp_status[LEFT_BTN]  <= ~gp_left_x;
+                    gp_status[RIGHT_BTN] <= ~gp_right_mode;
+                    gp_status[B_BTN]     <= ~gp_b_a;
+                    gp_status[C_BTN]     <= ~gp_c_start;
+                end
+            endcase
+
+            // Захват "сырых" значений линий (биты 21:16)
+            gp_status[21:16] <= {
+                gp_c_start,
+                gp_b_a,
+                gp_right_mode,
+                gp_left_x,
+                gp_down_y,
+                gp_up_z
+            };
+        end
+    end
+
+endmodule
