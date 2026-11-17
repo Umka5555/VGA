@@ -1,0 +1,153 @@
+
+`timescale 1 ns / 1 ps
+
+	module SEGAGamePad #
+	(
+		// Users to add parameters here
+
+		// User parameters ends
+		// Do not modify the parameters beyond this line
+
+
+		// Parameters of Axi Slave Bus Interface S00_AXI
+		parameter integer C_S00_AXI_DATA_WIDTH	= 32,
+		parameter integer C_S00_AXI_ADDR_WIDTH	= 4,
+		parameter integer DELAY_US_TICKS 	= 150,
+	    parameter integer CORE_VERSION 	= 1	
+	)
+	(
+		// Users to add ports here
+        input wire gp_up_z,
+        input wire gp_down_y,
+        input wire gp_left_x,
+        input wire gp_right_mode,
+        input wire gp_c_start,
+        input wire gp_b_a,
+        output wire gp_sel,
+        output wire interrupt,
+		// User ports ends
+		// Do not modify the ports beyond this line
+
+
+		// Ports of Axi Slave Bus Interface S00_AXI
+		input wire  s00_axi_aclk,
+		input wire  s00_axi_aresetn,
+		input wire [C_S00_AXI_ADDR_WIDTH-1 : 0] s00_axi_awaddr,
+		input wire [2 : 0] s00_axi_awprot,
+		input wire  s00_axi_awvalid,
+		output wire  s00_axi_awready,
+		input wire [C_S00_AXI_DATA_WIDTH-1 : 0] s00_axi_wdata,
+		input wire [(C_S00_AXI_DATA_WIDTH/8)-1 : 0] s00_axi_wstrb,
+		input wire  s00_axi_wvalid,
+		output wire  s00_axi_wready,
+		output wire [1 : 0] s00_axi_bresp,
+		output wire  s00_axi_bvalid,
+		input wire  s00_axi_bready,
+		input wire [C_S00_AXI_ADDR_WIDTH-1 : 0] s00_axi_araddr,
+		input wire [2 : 0] s00_axi_arprot,
+		input wire  s00_axi_arvalid,
+		output wire  s00_axi_arready,
+		output wire [C_S00_AXI_DATA_WIDTH-1 : 0] s00_axi_rdata,
+		output wire [1 : 0] s00_axi_rresp,
+		output wire  s00_axi_rvalid,
+		input wire  s00_axi_rready
+	);
+// Instantiation of Axi Bus Interface S00_AXI
+	SEGAGamePad_slave_lite_v1_0_S00_AXI # ( 
+		.C_S_AXI_DATA_WIDTH(C_S00_AXI_DATA_WIDTH),
+		.C_S_AXI_ADDR_WIDTH(C_S00_AXI_ADDR_WIDTH)
+	) SEGAGamePad_slave_lite_v1_0_S00_AXI_inst (
+		.S_AXI_ACLK(s00_axi_aclk),
+		.S_AXI_ARESETN(s00_axi_aresetn),
+		.S_AXI_AWADDR(s00_axi_awaddr),
+		.S_AXI_AWPROT(s00_axi_awprot),
+		.S_AXI_AWVALID(s00_axi_awvalid),
+		.S_AXI_AWREADY(s00_axi_awready),
+		.S_AXI_WDATA(s00_axi_wdata),
+		.S_AXI_WSTRB(s00_axi_wstrb),
+		.S_AXI_WVALID(s00_axi_wvalid),
+		.S_AXI_WREADY(s00_axi_wready),
+		.S_AXI_BRESP(s00_axi_bresp),
+		.S_AXI_BVALID(s00_axi_bvalid),
+		.S_AXI_BREADY(s00_axi_bready),
+		.S_AXI_ARADDR(s00_axi_araddr),
+		.S_AXI_ARPROT(s00_axi_arprot),
+		.S_AXI_ARVALID(s00_axi_arvalid),
+		.S_AXI_ARREADY(s00_axi_arready),
+		.S_AXI_RDATA(s00_axi_rdata),
+		.S_AXI_RRESP(s00_axi_rresp),
+		.S_AXI_RVALID(s00_axi_rvalid),
+		.S_AXI_RREADY(s00_axi_rready)
+	);
+
+	// Add user logic here
+// ============================================================
+// Внутренние сигналы связи между AXI-модулем и логикой
+// ============================================================
+wire [31:0] gp_status;   // статус кнопок: logic -> AXI (в регистр STATUS)
+wire        polling;     // режим опроса: AXI (CONTROL) -> logic
+wire        select;      // ручное управление sel: AXI (CONTROL) -> logic
+
+// ============================================================
+// Экземпляр AXI-интерфейса (сгенерирован Vivado + правки)
+// ============================================================
+SEGAGamePad_slave_lite_v1_0_S00_AXI #(
+ //   .C_S00_AXI_DATA_WIDTH (C_S00_AXI_DATA_WIDTH),
+ //   .C_S00_AXI_ADDR_WIDTH (C_S00_AXI_ADDR_WIDTH),
+ .CORE_VERSION         (CORE_VERSION)
+) 
+ axi_inst (
+    .s00_axi_aclk    (s00_axi_aclk),
+    .s00_axi_aresetn (s00_axi_aresetn),
+    .s00_axi_awaddr  (s00_axi_awaddr),
+    .s00_axi_awprot  (s00_axi_awprot),
+    .s00_axi_awvalid (s00_axi_awvalid),
+    .s00_axi_awready (s00_axi_awready),
+    .s00_axi_wdata   (s00_axi_wdata),
+    .s00_axi_wstrb   (s00_axi_wstrb),
+    .s00_axi_wvalid  (s00_axi_wvalid),
+    .s00_axi_wready  (s00_axi_wready),
+    .s00_axi_bresp   (s00_axi_bresp),
+    .s00_axi_bvalid  (s00_axi_bvalid),
+    .s00_axi_bready  (s00_axi_bready),
+    .s00_axi_araddr  (s00_axi_araddr),
+    .s00_axi_arprot  (s00_axi_arprot),
+    .s00_axi_arvalid (s00_axi_arvalid),
+    .s00_axi_arready (s00_axi_arready),
+    .s00_axi_rdata   (s00_axi_rdata),
+    .s00_axi_rresp   (s00_axi_rresp),
+    .s00_axi_rvalid  (s00_axi_rvalid),
+    .s00_axi_rready  (s00_axi_rready),
+
+    // ---- Пользовательские порты (добавлены вами) ----
+    .gp_status (gp_status),
+    .polling   (polling),
+    .select    (select),
+    .interrupt (interrupt)
+);
+
+// ============================================================
+// Экземпляр логики GamePad
+// ============================================================
+SEGAGamePad_logic #(
+    .DELAY_US_TICKS (DELAY_US_TICKS)
+) logic_inst (
+    .clk           (s00_axi_aclk),
+    .rst_n         (s00_axi_aresetn),
+
+    .polling       (polling),
+    .select        (select),
+
+    .gp_up_z       (gp_up_z),
+    .gp_down_y     (gp_down_y),
+    .gp_left_x     (gp_left_x),
+    .gp_right_mode (gp_right_mode),
+    .gp_c_start    (gp_c_start),
+    .gp_b_a        (gp_b_a),
+
+    .gp_sel        (gp_sel),
+    .gp_status     (gp_status)
+);
+	// User logic ends
+
+	endmodule
