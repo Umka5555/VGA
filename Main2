@@ -1,0 +1,59 @@
+#include <stdio.h>
+#include "xil_printf.h"
+#include "xil_types.h"
+#include "xil_io.h"      // Для работы с регистрами (Xil_In32 / Xil_Out32)
+#include "xparameters.h" // Для адресов (XPAR_...)
+#include "snake.h"
+
+// Адрес вашего IP-ядра с геймпадом (посмотрите точное имя в xparameters.h)
+#define GAMEPAD_BASEADDR XPAR_SEGAGAMEPAD_0_S00_AXI_BASEADDR 
+
+// Сюда нужно вставить адрес памяти, куда VDMA читает картинку (Frame Buffer)
+// Например, это может быть макрос из примера по VDMA, либо жестко заданный адрес
+#define FRAME_BUFFER_ADDR 0x10000000 
+
+// Прототип функции отрисовки (ее вам предстоит написать)
+void draw_snake(snake_t* snake, u32* framebuffer);
+
+int main() {
+    xil_printf("Game started!\r\n");
+
+    // 1. Инициализация змейки
+    snake_t my_snake = getNewSnake(); 
+
+    // 2. Включение опроса геймпада
+    // Регистр CONTROL (смещение 0x04). Бит 0 (EN) = 1, Бит 1 (P) = 1 (непрерывный опрос)
+    Xil_Out32(GAMEPAD_BASEADDR + 0x04, 0x03); 
+
+    u32 buttons = 0;
+    STATE_t state = STATE_OK;
+
+    // 3. Основной игровой цикл
+    while(1) {
+        // Чтение кнопок из регистра STATUS (смещение 0x08)
+        buttons = Xil_In32(GAMEPAD_BASEADDR + 0x08);
+
+        // Обработка нажатий (номера битов смотрите в описании регистров из лабы)
+        if (buttons & (1 << 0)) { my_snake.dir = CELL_UP; }    // UP
+        else if (buttons & (1 << 1)) { my_snake.dir = CELL_DW; } // DOWN
+        else if (buttons & (1 << 2)) { my_snake.dir = CELL_LF; } // LEFT
+        else if (buttons & (1 << 3)) { my_snake.dir = CELL_RT; } // RIGHT
+
+        // Движение змейки
+        state = moveSnake(&my_snake);
+
+        if (state == STATE_CRASH) {
+            xil_printf("Crash! Restarting...\r\n");
+            my_snake = getNewSnake(); // Рестарт при проигрыше
+        } else {
+            // Отрисовка кадра (функция draw_snake)
+            // draw_snake(&my_snake, (u32*)FRAME_BUFFER_ADDR);
+        }
+
+        // Задержка (чтобы змейка не летала слишком быстро)
+        // В Vitis можно использовать usleep() из unistd.h, или простой цикл for
+        for(volatile int i = 0; i < 5000000; i++); 
+    }
+
+    return 0;
+}
