@@ -1,0 +1,131 @@
+#ifndef SRC_SNAKE_H_ 
+#define SRC_SNAKE_H_ 
+ 
+#include <stdlib.h> 
+ 
+#ifndef H_SIZE 
+#define H_SIZE 640 
+#endif 
+ 
+#ifndef V_SIZE 
+#define V_SIZE 480 
+#endif 
+ 
+#define SNAKE_CELL_SIZE 16 
+#define MAP_H_SIZE  (H_SIZE/SNAKE_CELL_SIZE) 
+#define MAP_V_SIZE  (V_SIZE/SNAKE_CELL_SIZE) 
+ 
+#define START_LEN   5 
+#define APPLE_CNT   5 
+ 
+typedef enum { 
+    CELL_EMPTY  = 'e', 
+    CELL_UP     = 'u', 
+    CELL_DW     = 'd', 
+    CELL_LF     = 'l', 
+    CELL_RT     = 'r', 
+    CELL_HEAD   = 'h', 
+    CELL_APPLE  = 'a' 
+} CELL_t; 
+ 
+typedef enum { 
+    STATE_OK = 0, 
+    STATE_APPLE, 
+    STATE_CRASH 
+} STATE_t; 
+ 
+typedef struct { 
+    u8 snake_state [MAP_H_SIZE][MAP_V_SIZE]; 
+    u8 dir; 
+    size_t len; 
+    u8 head_x, head_y; 
+    u8 end_x, end_y; 
+    u8 apple_x, apple_y; 
+} snake_t; 
+
+void setRandApple(snake_t* snake){ 
+    u8 tmp_x, tmp_y; 
+    do{ 
+        tmp_x = rand() % MAP_H_SIZE; 
+        tmp_y = rand() % MAP_V_SIZE; 
+    } while(snake->snake_state[tmp_x][tmp_y] != 'e'); 
+    snake->snake_state[tmp_x][tmp_y] = 'a'; 
+} 
+ 
+void moveCell(u8 dir, u8* x, u8* y){ 
+    switch(dir){ 
+    case 'l': 
+        *x = *x == 0 ? MAP_H_SIZE-1 : *x - 1; 
+        break; 
+    case 'r': 
+        *x = *x == MAP_H_SIZE-1 ? 0 : *x + 1; 
+        break; 
+    case 'u': 
+        *y = *y == 0 ? MAP_V_SIZE-1 :*y - 1; 
+        break; 
+    case 'd': 
+        *y = *y == MAP_V_SIZE-1 ? 0 : *y + 1; 
+        break; 
+    } 
+ 
+} 
+ 
+snake_t getNewSnake(){ 
+    snake_t snake; 
+    for(int i = 0; i < MAP_H_SIZE; i++) 
+        for(int j = 0; j < MAP_V_SIZE; j++) 
+            snake.snake_state[i][j] = CELL_EMPTY; 
+    snake.dir = CELL_UP; 
+    snake.head_x = MAP_H_SIZE/2; 
+    snake.head_y = MAP_V_SIZE/2; 
+    snake.end_x = MAP_H_SIZE/2; 
+    snake.end_y = MAP_V_SIZE/2; 
+    snake.len = START_LEN; 
+ 
+    snake.snake_state[snake.head_x][snake.head_y] = CELL_HEAD; 
+ 
+    snake.end_x = snake.head_x; 
+    snake.end_y = snake.head_y; 
+ 
+    for(int i = 0; i < START_LEN-1; i++){ 
+        snake.end_y = (snake.end_y + 1) % MAP_V_SIZE; 
+        snake.snake_state[snake.end_x][snake.end_y] = CELL_UP; 
+    } 
+    for(int i = 0; i < APPLE_CNT; i++) 
+        setRandApple(&snake); 
+ 
+    return snake; 
+} 
+ 
+STATE_t moveSnake(snake_t* snake){ 
+ 
+    u8 tmp_x, tmp_y; 
+ 
+    snake->snake_state[snake->head_x][snake->head_y] = snake->dir; 
+ 
+    moveCell(snake->dir,&snake->head_x,&snake->head_y); 
+ 
+    if(snake->snake_state[snake->head_x][snake->head_y] == 'a'){ 
+        snake->len++; 
+        snake->snake_state[snake->head_x][snake->head_y] = CELL_HEAD; 
+        setRandApple(snake); 
+        return STATE_APPLE; 
+    } 
+ 
+    if(snake->snake_state[snake->head_x][snake->head_y] != 'e'){ 
+        snake->snake_state[snake->head_x][snake->head_y] = CELL_HEAD; 
+        return STATE_CRASH; 
+    } 
+ 
+    snake->snake_state[snake->head_x][snake->head_y] = CELL_HEAD; 
+    tmp_x = snake->end_x; 
+    tmp_y = snake->end_y; 
+ 
+    moveCell(snake->snake_state[snake->end_x][snake->end_y], 
+            &snake->end_x,&snake->end_y); 
+ 
+    snake->snake_state[tmp_x][tmp_y] = 'e'; 
+ 
+    return STATE_OK; 
+} 
+#endif /* SRC_SNAKE_H_ */ 
